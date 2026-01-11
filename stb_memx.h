@@ -29,7 +29,7 @@ extern "C"
         MEMX_U64,
         MEMX_F32,
         MEMX_F64,
-        MEMX_STRING
+        MEMX_BLOB
     } MemxType;
 
     typedef struct
@@ -61,6 +61,19 @@ extern "C"
 /**
  * WINDOWS IMPLEMENTATION
  */
+
+#ifdef _WIN32
+/* No extra includes needed for win32 */
+#else
+/**
+ * LINUX IMPLEMENTATION
+ */
+#define _GNU_SOURCE
+#include <sys/uio.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,8 +112,17 @@ MEMX_API MemxProcess *memx_open_process(uint32_t pid)
     p->pid = pid;
     return p;
 #else
-    (void)pid;
-    return NULL;
+    char path[64];
+    sprintf(path, "/proc/%u/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return NULL;
+    fclose(f);
+
+    MemxProcess *p = (MemxProcess *)malloc(sizeof(MemxProcess));
+    p->pid = pid;
+
+    return p;
 #endif
 }
 
@@ -114,7 +136,8 @@ MEMX_API void memx_close_process(MemxProcess *p)
     free(p);
 }
 
-static int isGoodRegion(MEMORY_BASIC_INFORMATION *mbi)
+#ifdef _WIN32
+static int isGoodRegionWin32(MEMORY_BASIC_INFORMATION *mbi)
 {
     if (mbi->State != MEM_COMMIT)
         return 0;
@@ -122,8 +145,10 @@ static int isGoodRegion(MEMORY_BASIC_INFORMATION *mbi)
         return 0;
     if (mbi->Protect & PAGE_GUARD)
         return 0;
+
     return 1;
 }
+#endif
 
 static size_t type_size(MemxType t)
 {
@@ -151,10 +176,25 @@ static int match_value(const unsigned char *mem, const unsigned char *val,
     return memcmp(mem, val, size) == 0;
 }
 
+static int memx_read_raw(MemxProcess *p, void *address, void *buffer, size_t size)
+{
+#ifdef _WIN32
+    SIZE_T bytesRead;
+    return ReadProcessMemory(p->handle, address, buffer, size, &bytesRead) && bytesRead == size;
+#else
+    struct iovec local[1];
+    struct iovec remote[1];
+    local[0].iov_base = buffer;
+    local[0].iov_len = size;
+    remote[0].iov_base = address;
+    remote[0].iov_len = size;
+    return process_vm_readv(p->pid, local, 1, remote, 1, 0) == (ssize_t)size;
+#endif
+}
+
 MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
                                    const void *value, size_t value_size)
 {
-#ifdef _WIN32
     if (!p || !value)
         return NULL;
 
@@ -170,6 +210,7 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
     scan->candidates =
         (MemxCandidate *)malloc(scan->capacity * sizeof(MemxCandidate));
 
+#ifdef _WIN32
     SYSTEM_INFO sys;
     GetSystemInfo(&sys);
 
@@ -180,7 +221,7 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
     {
         if (VirtualQueryEx(p->handle, addr, &mbi, sizeof(mbi)) != sizeof(mbi))
             break;
-        if (!isGoodRegion(&mbi))
+        if (!isGoodRegionWin32(&mbi))
         {
             addr += mbi.RegionSize;
             continue;
@@ -192,12 +233,10 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
         }
 
         unsigned char *buffer = (unsigned char *)malloc(mbi.RegionSize);
-        SIZE_T bytesRead;
-        if (ReadProcessMemory(p->handle, mbi.BaseAddress, buffer, mbi.RegionSize,
-                              &bytesRead))
+        if (memx_read_raw(p, mbi.BaseAddress, buffer, mbi.RegionSize))
         {
-            SIZE_T step = (type == MEMX_STRING) ? 1 : type_size(type);
-            for (SIZE_T i = 0; i + value_size <= bytesRead; i += step)
+            size_t step = (type == MEMX_BLOB) ? 1 : type_size(type);
+            for (size_t i = 0; i + value_size <= mbi.RegionSize; i += step)
             {
                 if (match_value(buffer + i, scan->value_bytes, value_size))
                 {
@@ -207,6 +246,7 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
                         scan->candidates = (MemxCandidate *)realloc(
                             scan->candidates, scan->capacity * sizeof(MemxCandidate));
                     }
+
                     scan->candidates[scan->count++].address =
                         (unsigned char *)mbi.BaseAddress + i;
                 }
@@ -215,41 +255,78 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
         free(buffer);
         addr += mbi.RegionSize;
     }
+#else
+    char path[64];
+    sprintf(path, "/proc/%u/maps", p->pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return scan;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f))
+    {
+        uintptr_t start, end;
+        char perms[5];
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3)
+            continue;
+
+        // TODO: address pattern check
+        // For now, we only check fo readable memory
+        if (perms[0] != 'r')
+            continue;
+
+        size_t region_size = end - start;
+        if (region_size < value_size)
+            continue;
+
+        unsigned char *buffer = (unsigned char *)malloc(region_size);
+        if (memx_read_raw(p, (void *)start, buffer, region_size))
+        {
+            size_t step = (type == MEMX_BLOB) ? 1 : type_size(type);
+            for (size_t i = 0; i + value_size <= region_size; i += step)
+            {
+                if (match_value(buffer + i, scan->value_bytes, value_size))
+                {
+                    if (scan->count >= scan->capacity)
+                    {
+                        scan->capacity *= 2;
+                        scan->candidates = (MemxCandidate *)realloc(
+                            scan->candidates, scan->capacity * sizeof(MemxCandidate));
+                    }
+                    scan->candidates[scan->count++].address = (void *)(start + i);
+                }
+            }
+        }
+        free(buffer);
+    }
+    fclose(f);
+#endif
 
     return scan;
-#else
-    (void)p;
-    (void)type;
-    (void)value;
-    (void)value_size;
-    return NULL;
-#endif
 }
 
 MEMX_API void memx_scan_refine(MemxScan *scan, const void *value,
                                size_t value_size)
 {
-#ifdef _WIN32
     if (!scan || !value)
         return;
     memcpy(scan->value_bytes, value, value_size);
     size_t new_count = 0;
     for (size_t i = 0; i < scan->count; i++)
     {
-        unsigned char buf[64]; /* assume small size */
-        if (ReadProcessMemory(scan->proc->handle, scan->candidates[i].address, buf,
-                              value_size, NULL))
+        unsigned char buf[1024];
+        void *target_buf = (value_size <= sizeof(buf)) ? buf : malloc(value_size);
+
+        if (memx_read_raw(scan->proc, scan->candidates[i].address, target_buf, value_size))
         {
-            if (match_value(buf, scan->value_bytes, value_size))
+            if (match_value((unsigned char *)target_buf, scan->value_bytes, value_size))
                 scan->candidates[new_count++] = scan->candidates[i];
         }
+
+        if (target_buf != buf)
+            free(target_buf);
     }
     scan->count = new_count;
-#else
-    (void)scan;
-    (void)value;
-    (void)value_size;
-#endif
 }
 
 MEMX_API size_t memx_scan_count(const MemxScan *scan)
@@ -280,16 +357,18 @@ MEMX_API void memx_scan_free(MemxScan *scan)
 MEMX_API int memx_write(MemxProcess *p, void *address, const void *value,
                         size_t size)
 {
-#ifdef _WIN32
     if (!p || !address || !value)
         return 0;
+#ifdef _WIN32
     return WriteProcessMemory(p->handle, address, value, size, NULL) != 0;
 #else
-    (void)p;
-    (void)address;
-    (void)value;
-    (void)size;
-    return 0;
+    struct iovec local[1];
+    struct iovec remote[1];
+    local[0].iov_base = (void *)value;
+    local[0].iov_len = size;
+    remote[0].iov_base = address;
+    remote[0].iov_len = size;
+    return process_vm_writev(p->pid, local, 1, remote, 1, 0) == (ssize_t)size;
 #endif
 }
 

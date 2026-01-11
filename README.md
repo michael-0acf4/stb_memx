@@ -5,7 +5,7 @@ editing live process memory.
 
 ## Why?
 
-Yeah. I am asking you, why would you want use a tool like this instead of a
+Yeah. I am asking you, why would you want to use a tool like this instead of a
 debugger?
 
 Exactly.
@@ -22,8 +22,9 @@ This is not a CE replacement whatsoever.
 
 ## Usage
 
-Currently, it allows i8, u8, i32, u32, f32, f64, char* analysis, refer to the
-examples.
+Currently, it allows i8, u8, i32, u32, f32, f64, and raw data blob analysis.
+
+Refer to the examples.
 
 ```c
 MEMX_API MemxProcess *memx_open_process(uint32_t pid);

@@ -4,6 +4,17 @@
 #include <stdio.h>
 #include <stdint.h>
 
+static int CALL_COUNTER = 0;
+
+int my_eq_comparator(const unsigned char *mem,
+                     const unsigned char *val,
+                     size_t size,
+                     MemxType type)
+{
+  CALL_COUNTER++;
+  return -1; // -1 to fallback
+}
+
 int main(void)
 {
   uint32_t pid;
@@ -33,7 +44,8 @@ int main(void)
   }
 
   printf("\nStarting first scan...\n");
-  MemxScan *scan = memx_scan_begin(proc, MEMX_I32, &value, sizeof(value));
+  // MemxScan *scan = memx_scan_begin(proc, MEMX_I32, &value, sizeof(value), NULL);
+  MemxScan *scan = memx_scan_begin(proc, MEMX_I32, &value, sizeof(value), (MemxComparator)&my_eq_comparator);
   if (!scan)
   {
     printf("Scan failed\n");
@@ -42,7 +54,7 @@ int main(void)
   }
 
   size_t count = memx_scan_count(scan);
-  printf("First scan: %zu candidates found\n", count);
+  printf("First scan: %zu candidates found (comparisons %d)\n", count, CALL_COUNTER);
 
   while (count > 1)
   {
@@ -58,7 +70,7 @@ int main(void)
 
     memx_scan_refine(scan, &value, sizeof(value));
     count = memx_scan_count(scan);
-    printf("Refined: %zu candidates remaining\n", count);
+    printf("Refined: %zu candidates remaining (comparisons %d)\n", count, CALL_COUNTER);
   }
 
   if (count == 1)

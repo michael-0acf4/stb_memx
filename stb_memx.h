@@ -37,6 +37,11 @@ extern "C"
         MEMX_BLOB
     } MemxType;
 
+    typedef int (*MemxComparator)(const unsigned char *mem,
+                                  const unsigned char *val,
+                                  size_t size,
+                                  MemxType type);
+
     typedef struct
     {
         void *address;
@@ -46,7 +51,7 @@ extern "C"
     MEMX_API void memx_close_process(MemxProcess *p);
 
     MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
-                                       const void *value, size_t value_size);
+                                       const void *value, size_t value_size, MemxComparator cp);
     MEMX_API void memx_scan_refine(MemxScan *scan, const void *value,
                                    size_t value_size);
     MEMX_API size_t memx_scan_count(const MemxScan *scan);
@@ -81,6 +86,7 @@ struct MemxScan
     MemxType type;
     size_t value_size;
     unsigned char *value_bytes;
+    MemxComparator comparator;
 
     MemxCandidate *candidates;
     size_t count;
@@ -125,7 +131,7 @@ MEMX_API void memx_close_process(MemxProcess *p)
 }
 
 #ifdef _WIN32
-static int isGoodRegionWin32(MEMORY_BASIC_INFORMATION *mbi)
+static int is_good_region(MEMORY_BASIC_INFORMATION *mbi)
 {
     if (mbi->State != MEM_COMMIT)
         return 0;
@@ -137,7 +143,7 @@ static int isGoodRegionWin32(MEMORY_BASIC_INFORMATION *mbi)
     return 1;
 }
 #else
-static int isGoodRegionLinux(uintptr_t start, const char *line, const char *perms)
+static int is_good_region(uintptr_t start, const char *line, const char *perms)
 {
     if (perms[0] != 'r')
         return 0;
@@ -183,8 +189,15 @@ static size_t type_size(MemxType t)
 }
 
 static int match_value(const unsigned char *mem, const unsigned char *val,
-                       size_t size)
+                       size_t size, MemxType type, MemxComparator cp)
 {
+    if (cp)
+    {
+        int res = cp(mem, val, size, type);
+        if (res >= 0)
+            return res;
+    }
+
     return memcmp(mem, val, size) == 0;
 }
 
@@ -205,7 +218,7 @@ static int memx_read_raw(MemxProcess *p, void *address, void *buffer, size_t siz
 }
 
 MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
-                                   const void *value, size_t value_size)
+                                   const void *value, size_t value_size, MemxComparator cp)
 {
     if (!p || !value)
         return NULL;
@@ -215,6 +228,7 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
     scan->type = type;
     scan->value_size = value_size;
     scan->value_bytes = (unsigned char *)malloc(value_size);
+    scan->comparator = cp;
     memcpy(scan->value_bytes, value, value_size);
 
     scan->count = 0;
@@ -233,7 +247,7 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
     {
         if (VirtualQueryEx(p->handle, addr, &mbi, sizeof(mbi)) != sizeof(mbi))
             break;
-        if (!isGoodRegionWin32(&mbi))
+        if (!is_good_region(&mbi))
         {
             addr += mbi.RegionSize;
             continue;
@@ -250,7 +264,7 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
             size_t step = (type == MEMX_BLOB) ? 1 : type_size(type);
             for (size_t i = 0; i + value_size <= mbi.RegionSize; i += step)
             {
-                if (match_value(buffer + i, scan->value_bytes, value_size))
+                if (match_value(buffer + i, scan->value_bytes, value_size, scan->type, scan->comparator))
                 {
                     if (scan->count >= scan->capacity)
                     {
@@ -282,7 +296,7 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
         if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3)
             continue;
 
-        if (!isGoodRegionLinux(start, line, perms))
+        if (!is_good_region(start, line, perms))
             continue;
 
         size_t region_size = end - start;
@@ -295,7 +309,7 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
             size_t step = (type == MEMX_BLOB) ? 1 : type_size(type);
             for (size_t i = 0; i + value_size <= region_size; i += step)
             {
-                if (match_value(buffer + i, scan->value_bytes, value_size))
+                if (match_value(buffer + i, scan->value_bytes, value_size, scan->type, scan->comparator))
                 {
                     if (scan->count >= scan->capacity)
                     {
@@ -329,7 +343,7 @@ MEMX_API void memx_scan_refine(MemxScan *scan, const void *value,
 
         if (memx_read_raw(scan->proc, scan->candidates[i].address, target_buf, value_size))
         {
-            if (match_value((unsigned char *)target_buf, scan->value_bytes, value_size))
+            if (match_value((unsigned char *)target_buf, scan->value_bytes, value_size, scan->type, scan->comparator))
                 scan->candidates[new_count++] = scan->candidates[i];
         }
 

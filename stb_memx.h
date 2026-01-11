@@ -1,15 +1,20 @@
 #ifndef MEMX_H
 #define MEMX_H
 
-#include <stddef.h>
-#include <stdint.h>
-
 #ifdef _WIN32
-#include <windows.h>
 #define MEMX_API __declspec(dllexport)
+#include <windows.h>
 #else
 #define MEMX_API
+#define _GNU_SOURCE
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
+
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C"
@@ -57,23 +62,6 @@ extern "C"
 #endif
 
 #ifdef STB_MEMX_IMPLEMENTATION
-
-/**
- * WINDOWS IMPLEMENTATION
- */
-
-#ifdef _WIN32
-/* No extra includes needed for win32 */
-#else
-/**
- * LINUX IMPLEMENTATION
- */
-#define _GNU_SOURCE
-#include <sys/uio.h>
-#include <sys/types.h>
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,6 +134,30 @@ static int isGoodRegionWin32(MEMORY_BASIC_INFORMATION *mbi)
     if (mbi->Protect & PAGE_GUARD)
         return 0;
 
+    return 1;
+}
+#else
+static int isGoodRegionLinux(uintptr_t start, const char *line, const char *perms)
+{
+    if (perms[0] != 'r')
+        return 0;
+
+    // Kernel/non-canonical addr
+    // limit on 64-bit systems
+    if (start >= 0x7fffffffffff)
+        return 0;
+    if (perms[0] != 'r' || perms[3] != 'p')
+        return 0;
+
+    // System-reserved regions by name
+    // line contains the path at the end
+    // -> skip virtual memory tagged region [vvar], [vdso], [vsyscall]
+    // https://0xax.gitbooks.io/linux-insides/content/SysCall/linux-syscall-3.html
+    if (strstr(line, "[v"))
+        return 0;
+
+    // if (!strstr(line, "[stack]"))
+    //    return 0;
     return 1;
 }
 #endif
@@ -270,9 +282,7 @@ MEMX_API MemxScan *memx_scan_begin(MemxProcess *p, MemxType type,
         if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3)
             continue;
 
-        // TODO: address pattern check
-        // For now, we only check fo readable memory
-        if (perms[0] != 'r')
+        if (!isGoodRegionLinux(start, line, perms))
             continue;
 
         size_t region_size = end - start;
